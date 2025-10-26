@@ -1,5 +1,5 @@
 # Stanford-CS336-Language-Modeling-from-Scratch
-
+## [Course Video](https://www.bilibili.com/video/BV14X41zZEPh/)
 ## Set up a proxy server to access external resources (when local Clash and server are not on the same LAN)    
 Establish SSH remote forwarding on the local terminal     
 ```
