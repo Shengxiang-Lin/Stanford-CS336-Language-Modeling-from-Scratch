@@ -903,11 +903,9 @@ def run_train_bpe(
                 representing that <token1> was merged with <token2>.
                 Merges are ordered by order of creation.
     """
-    import os
     import regex as re
-    from collections import defaultdict
     import heapq
-    from typing import Any, Iterator
+    from tqdm import tqdm
     # Initialize vocabulary with special tokens and single bytes
     vocab = {}
     stoi = {}  # bytes -> id
@@ -953,7 +951,7 @@ def run_train_bpe(
     # Convert text to initial token sequences (single bytes)
     initial_vocab_map = {v: k for k, v in itos.items()}
     token_groups = []
-    for part in text_parts:
+    for part in tqdm(text_parts, desc="Preprocessing"):
         if part in special_tokens or not part:
             continue
         words_in_bytes = pretokenize(part)
@@ -1001,7 +999,7 @@ def run_train_bpe(
     pos = {}    # (token_id1, token_id2) -> set of node_ids where this pair starts
     
     # Build initial linked list from token groups
-    for token_lst in token_groups:
+    for token_lst in tqdm(token_groups, desc="Building initial data structures"):
         if not token_lst or len(token_lst) <= 1:
             continue
         token_lst_len = len(token_lst)
@@ -1047,6 +1045,7 @@ def run_train_bpe(
     
     # Perform merges until we reach the desired vocabulary size
     num_merges_needed = vocab_size - len(vocab)
+    pbar = tqdm(total=num_merges_needed, desc="BPE merges")
     while num_merges_needed > 0 and heap:
         if not pair_counts:
             break
@@ -1113,6 +1112,8 @@ def run_train_bpe(
             pair_counts.pop((p1, p2), None)
             pos.pop((p1, p2), None)
             break
-    
+        pbar.update(1)
+    pbar.close()
+    print(f"BPE training completed. Final vocabulary size: {len(vocab)}")
     return vocab, merges
     #raise NotImplementedError
