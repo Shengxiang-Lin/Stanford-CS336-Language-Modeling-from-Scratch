@@ -28,8 +28,8 @@ def run_linear(
     Returns:
         Float[Tensor, "... d_out"]: The transformed output of your linear module.
     """
-
-    raise NotImplementedError
+    return torch.matmul(in_features, weights.T)
+    #raise NotImplementedError
 
 
 def run_embedding(
@@ -50,8 +50,8 @@ def run_embedding(
     Returns:
         Float[Tensor, "... d_model"]: Batch of embeddings returned by your Embedding layer.
     """
-
-    raise NotImplementedError
+    return torch.nn.functional.embedding(token_ids, weights)
+    #raise NotImplementedError
 
 
 def run_swiglu(
@@ -83,7 +83,11 @@ def run_swiglu(
     # swiglu.w1.weight.data = w1_weight
     # swiglu.w2.weight.data = w2_weight
     # swiglu.w3.weight.data = w3_weight
-    raise NotImplementedError
+    gate = torch.nn.functional.silu(torch.matmul(in_features, w1_weight.T))
+    value = torch.matmul(in_features, w3_weight.T)
+    output = torch.matmul(gate * value, w2_weight.T)
+    return output
+    #raise NotImplementedError
 
 
 def run_scaled_dot_product_attention(
@@ -104,7 +108,14 @@ def run_scaled_dot_product_attention(
     Returns:
         Float[Tensor, " ... queries d_v"]: Output of SDPA
     """
-    raise NotImplementedError
+    d_k = Q.size(-1)
+    scores = torch.matmul(Q, K.transpose(-2, -1)) / (d_k ** 0.5)
+    if mask is not None:
+        scores = scores.masked_fill(mask == False, float('-inf'))
+    attention_weights = torch.nn.functional.softmax(scores, dim=-1)
+    output = torch.matmul(attention_weights, V)
+    return output
+    #raise NotImplementedError
 
 
 def run_multihead_self_attention(
@@ -138,7 +149,25 @@ def run_multihead_self_attention(
         Float[Tensor, " ... sequence_length d_out"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
+    batch_size, seq_len, d_in = in_features.shape
+    d_k = d_model // num_heads
+    d_v = d_model // num_heads
+    Q = torch.matmul(in_features, q_proj_weight.T)
+    K = torch.matmul(in_features, k_proj_weight.T)
+    V = torch.matmul(in_features, v_proj_weight.T)
+    Q = Q.view(batch_size, seq_len, num_heads, d_k).transpose(1, 2)
+    K = K.view(batch_size, seq_len, num_heads, d_k).transpose(1, 2)
+    V = V.view(batch_size, seq_len, num_heads, d_v).transpose(1, 2)
+    d_k_scalar = Q.size(-1)
+    scores = torch.matmul(Q, K.transpose(-2, -1)) / (d_k_scalar ** 0.5)
+    mask = torch.triu(torch.ones(seq_len, seq_len, device=in_features.device) * float('-inf'), diagonal=1)
+    scores = scores + mask
+    attention_weights = torch.nn.functional.softmax(scores, dim=-1)
+    attention_output = torch.matmul(attention_weights, V) 
+    attention_output = attention_output.transpose(1, 2).contiguous().view(batch_size, seq_len, d_model)
+    output = torch.matmul(attention_output, o_proj_weight.T)
+    return output
+    #raise NotImplementedError
 
 
 def run_multihead_self_attention_with_rope(
@@ -178,7 +207,38 @@ def run_multihead_self_attention_with_rope(
         Float[Tensor, " ... sequence_length d_out"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
+    batch_size, seq_len, d_in = in_features.shape
+    if token_positions is None:
+        token_positions = torch.arange(seq_len, device=in_features.device).unsqueeze(0).expand(batch_size, seq_len) 
+    # 每个头的维度
+    head_dim = d_model // num_heads
+    Q = torch.matmul(in_features, q_proj_weight.T)
+    K = torch.matmul(in_features, k_proj_weight.T)
+    V = torch.matmul(in_features, v_proj_weight.T)
+    Q = Q.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2)
+    K = K.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2)
+    V = V.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2)
+    Q_reshaped = Q.reshape(batch_size * num_heads, seq_len, head_dim)
+    K_reshaped = K.reshape(batch_size * num_heads, seq_len, head_dim)
+    token_positions_expanded = token_positions.unsqueeze(1).expand(batch_size, num_heads, seq_len)
+    token_positions_expanded = token_positions_expanded.reshape(batch_size * num_heads, seq_len)
+    Q_rope = run_rope(head_dim, theta, max_seq_len, Q_reshaped, token_positions_expanded)
+    K_rope = run_rope(head_dim, theta, max_seq_len, K_reshaped, token_positions_expanded)
+    Q_rope = Q_rope.reshape(batch_size, num_heads, seq_len, head_dim)
+    K_rope = K_rope.reshape(batch_size, num_heads, seq_len, head_dim)
+    attention_scores = torch.matmul(Q_rope, K_rope.transpose(-2, -1)) / (head_dim ** 0.5)
+    causal_mask = torch.triu(
+        torch.full((seq_len, seq_len), float('-inf'), device=in_features.device), 
+        diagonal=1
+    ).unsqueeze(0).unsqueeze(0)
+    attention_scores = attention_scores + causal_mask
+    attention_weights = torch.nn.functional.softmax(attention_scores, dim=-1)
+    attention_output = torch.matmul(attention_weights, V)
+    attention_output = attention_output.transpose(1, 2).contiguous()
+    attention_output = attention_output.view(batch_size, seq_len, d_model)
+    output = torch.matmul(attention_output, o_proj_weight.T) 
+    return output
+    #raise NotImplementedError
 
 
 def run_rope(
@@ -200,7 +260,23 @@ def run_rope(
     Returns:
         Float[Tensor, " ... sequence_length d_k"]: Tensor with RoPEd input.
     """
-    raise NotImplementedError
+    batch_size, seq_len, d_k = in_query_or_key.shape
+    x = in_query_or_key.reshape(batch_size, seq_len, d_k // 2, 2)
+    if token_positions.dim() == 1:
+        token_positions = token_positions.unsqueeze(0).expand(batch_size, seq_len)
+    freqs = 1.0 / (theta ** (torch.arange(0, d_k, 2, dtype=torch.float32, device=in_query_or_key.device) / d_k))
+    positions = token_positions.unsqueeze(-1).float()
+    angles = positions * freqs
+    cos = torch.cos(angles).unsqueeze(-1)
+    sin = torch.sin(angles).unsqueeze(-1)
+    x1 = x[..., 0:1] 
+    x2 = x[..., 1:2]
+    rotated_x1 = x1 * cos - x2 * sin
+    rotated_x2 = x1 * sin + x2 * cos
+    result = torch.cat([rotated_x1, rotated_x2], dim=-1)
+    result = result.reshape(batch_size, seq_len, d_k)
+    return result
+    #raise NotImplementedError
 
 
 def run_transformer_block(
@@ -273,7 +349,23 @@ def run_transformer_block(
         Float[Tensor, "batch sequence_length d_model"] Tensor with the output of
         running the Transformer block on the input features while using RoPE.
     """
-    raise NotImplementedError
+    x = run_rmsnorm(d_model, 1e-5, weights['ln1.weight'], in_features)
+    x_attn = run_multihead_self_attention_with_rope(
+        d_model, num_heads, max_seq_len, theta,
+        weights['attn.q_proj.weight'], weights['attn.k_proj.weight'], 
+        weights['attn.v_proj.weight'], weights['attn.output_proj.weight'],
+        x
+    )
+    x = in_features + x_attn
+    x_norm = run_rmsnorm(d_model, 1e-5, weights['ln2.weight'], x)
+    x_ffn = run_swiglu(
+        d_model, d_ff,
+        weights['ffn.w1.weight'], weights['ffn.w2.weight'], weights['ffn.w3.weight'],
+        x_norm
+    )
+    x = x + x_ffn
+    return x
+    #raise NotImplementedError
 
 
 def run_transformer_lm(
@@ -355,7 +447,27 @@ def run_transformer_lm(
         Float[Tensor, "batch_size sequence_length vocab_size"]: Tensor with the predicted unnormalized
         next-word distribution for each token.
     """
-    raise NotImplementedError
+    x = torch.nn.functional.embedding(in_indices, weights['token_embeddings.weight'])
+    for i in range(num_layers):
+        layer_weights = {
+            'attn.q_proj.weight': weights[f'layers.{i}.attn.q_proj.weight'],
+            'attn.k_proj.weight': weights[f'layers.{i}.attn.k_proj.weight'],
+            'attn.v_proj.weight': weights[f'layers.{i}.attn.v_proj.weight'],
+            'attn.output_proj.weight': weights[f'layers.{i}.attn.output_proj.weight'],
+            'ln1.weight': weights[f'layers.{i}.ln1.weight'],
+            'ffn.w1.weight': weights[f'layers.{i}.ffn.w1.weight'],
+            'ffn.w2.weight': weights[f'layers.{i}.ffn.w2.weight'],
+            'ffn.w3.weight': weights[f'layers.{i}.ffn.w3.weight'],
+            'ln2.weight': weights[f'layers.{i}.ln2.weight']
+        }
+        x = run_transformer_block(
+            d_model, num_heads, d_ff, context_length, rope_theta,
+            layer_weights, x
+        )
+    x = run_rmsnorm(d_model, 1e-5, weights['ln_final.weight'], x)
+    logits = torch.matmul(x, weights['lm_head.weight'].T)
+    return logits
+    #raise NotImplementedError
 
 
 def run_rmsnorm(
@@ -378,7 +490,10 @@ def run_rmsnorm(
         Float[Tensor,"... d_model"]: Tensor of with the same shape as `in_features` with the output of running
         RMSNorm of the `in_features`.
     """
-    raise NotImplementedError
+    rms = torch.sqrt(torch.mean(in_features ** 2, dim=-1, keepdim=True) + eps)
+    normalized = in_features / rms
+    return normalized * weights
+    #raise NotImplementedError
 
 
 def run_silu(in_features: Float[Tensor, " ..."]) -> Float[Tensor, " ..."]:
@@ -392,7 +507,8 @@ def run_silu(in_features: Float[Tensor, " ..."]) -> Float[Tensor, " ..."]:
         Float[Tensor,"..."]: of with the same shape as `in_features` with the output of applying
         SiLU to each element.
     """
-    raise NotImplementedError
+    return torch.nn.functional.silu(in_features)
+    #raise NotImplementedError
 
 
 def run_get_batch(
@@ -415,7 +531,12 @@ def run_get_batch(
         is the sampled input sequences, and the second tuple item is the corresponding
         language modeling labels.
     """
-    raise NotImplementedError
+    data = torch.from_numpy(dataset).long()
+    start_indices = torch.randint(0, len(data) - context_length, (batch_size,))
+    inputs = torch.stack([data[i:i+context_length] for i in start_indices])
+    labels = torch.stack([data[i+1:i+context_length+1] for i in start_indices])
+    return inputs.to(device), labels.to(device)
+    #raise NotImplementedError
 
 
 def run_softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, " ..."]:
@@ -431,7 +552,8 @@ def run_softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, "
         Float[Tensor, "..."]: Tensor of with the same shape as `in_features` with the output of
         softmax normalizing the specified `dim`.
     """
-    raise NotImplementedError
+    return torch.nn.functional.softmax(in_features, dim=dim)
+    #raise NotImplementedError
 
 
 def run_cross_entropy(
@@ -449,7 +571,8 @@ def run_cross_entropy(
     Returns:
         Float[Tensor, ""]: The average cross-entropy loss across examples.
     """
-    raise NotImplementedError
+    return torch.nn.functional.cross_entropy(inputs, targets)
+    #raise NotImplementedError
 
 
 def run_gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm: float) -> None:
@@ -461,14 +584,25 @@ def run_gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm:
 
     The gradients of the parameters (parameter.grad) should be modified in-place.
     """
-    raise NotImplementedError
+    total_norm = 0.0
+    for p in parameters:
+        if p.grad is not None:
+            total_norm += p.grad.data.norm(2).item() ** 2
+    total_norm = total_norm ** 0.5
+    if total_norm > max_l2_norm:
+        clip_coef = max_l2_norm / (total_norm + 1e-6)
+        for p in parameters:
+            if p.grad is not None:
+                p.grad.data.mul_(clip_coef)
+    #raise NotImplementedError
 
 
 def get_adamw_cls() -> Any:
     """
     Returns a torch.optim.Optimizer that implements AdamW.
     """
-    raise NotImplementedError
+    return torch.optim.AdamW
+    #raise NotImplementedError
 
 
 def run_get_lr_cosine_schedule(
@@ -496,7 +630,16 @@ def run_get_lr_cosine_schedule(
     Returns:
         Learning rate at the given iteration under the specified schedule.
     """
-    raise NotImplementedError
+    import math
+    if it < warmup_iters:
+        return max_learning_rate * (it / warmup_iters)
+    elif it <= cosine_cycle_iters:
+        progress = (it - warmup_iters) / (cosine_cycle_iters - warmup_iters)
+        cosine_decay = 0.5 * (1 + math.cos(math.pi * progress))
+        return min_learning_rate + (max_learning_rate - min_learning_rate) * cosine_decay
+    else:
+        return min_learning_rate
+    #raise NotImplementedError
 
 
 def run_save_checkpoint(
@@ -515,7 +658,16 @@ def run_save_checkpoint(
             we've completed.
         out (str | os.PathLike | BinaryIO | IO[bytes]): Path or file-like object to serialize the model, optimizer, and iteration to.
     """
-    raise NotImplementedError
+    checkpoint = {
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'iteration': iteration
+    }
+    if isinstance(out, (str, os.PathLike)):
+        torch.save(checkpoint, out)
+    else:
+        torch.save(checkpoint, out)
+    #raise NotImplementedError
 
 
 def run_load_checkpoint(
@@ -536,7 +688,14 @@ def run_load_checkpoint(
     Returns:
         int: the previously-serialized number of iterations.
     """
-    raise NotImplementedError
+    if isinstance(src, (str, os.PathLike)):
+        checkpoint = torch.load(src)
+    else:
+        checkpoint = torch.load(src)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    return checkpoint['iteration']
+    #raise NotImplementedError
 
 
 def get_tokenizer(
@@ -559,7 +718,165 @@ def get_tokenizer(
     Returns:
         A BPE tokenizer that uses the provided vocab, merges, and special tokens.
     """
-    raise NotImplementedError
+    class BPETokenizer:
+        def __init__(self, vocab: dict[int, bytes], merges: list[tuple[bytes, bytes]], special_tokens: list[str] | None = None):
+            self.vocab = vocab.copy()  # id -> bytes
+            self.merges = merges
+            self.special_tokens = special_tokens or []
+            # 创建反向映射 bytes -> id
+            self.vocab_inv = {v: k for k, v in self.vocab.items()}
+            # 为特殊token创建映射
+            self.special_tokens_bytes = [token.encode('utf-8') for token in self.special_tokens]
+            for special_token in self.special_tokens_bytes:
+                if special_token not in self.vocab_inv:
+                    new_id = len(self.vocab)
+                    self.vocab[new_id] = special_token
+                    self.vocab_inv[special_token] = new_id
+            # 构建合并优先级字典
+            self.merge_priority = {}
+            for i, (a, b) in enumerate(merges):
+                self.merge_priority[(a, b)] = i
+            # 构建特殊token trie用于快速查找
+            self.special_trie = self._build_special_trie()
+        
+        def _build_special_trie(self):
+            """构建特殊token的前缀树，用于快速查找"""
+            trie = {}
+            for token_bytes in self.special_tokens_bytes:
+                node = trie
+                for byte in token_bytes:
+                    if byte not in node:
+                        node[byte] = {}
+                    node = node[byte]
+                node[None] = token_bytes  # 标记结束
+            return trie
+        
+        def _find_special_tokens(self, text_bytes: bytes):
+            """在字节序列中查找特殊token"""
+            positions = []
+            i = 0
+            while i < len(text_bytes):
+                node = self.special_trie
+                j = i
+                matched_token = None
+                # 在前缀树中查找最长的匹配
+                while j < len(text_bytes) and text_bytes[j] in node:
+                    node = node[text_bytes[j]]
+                    j += 1
+                    if None in node:  # 找到完整的特殊token
+                        matched_token = node[None]
+                if matched_token:
+                    positions.append((i, i + len(matched_token), matched_token))
+                    i += len(matched_token)
+                else:
+                    i += 1
+            return positions
+        
+        def encode(self, text: str) -> list[int]:
+            """将文本编码为token IDs"""
+            if not text:
+                return []
+            text_bytes = text.encode('utf-8')
+            # 查找特殊token的位置
+            special_positions = self._find_special_tokens(text_bytes)
+            if not special_positions:
+                # 没有特殊token，直接编码整个文本
+                return self._bpe_encode(text_bytes)
+            # 分割文本为普通部分和特殊token部分
+            tokens = []
+            last_pos = 0
+            for start, end, special_token in special_positions:
+                # 添加特殊token之前的普通文本
+                if start > last_pos:
+                    ordinary_text = text_bytes[last_pos:start]
+                    tokens.extend(self._bpe_encode(ordinary_text))
+                # 添加特殊token
+                tokens.append(self.vocab_inv[special_token])
+                last_pos = end
+            # 添加剩余文本
+            if last_pos < len(text_bytes):
+                ordinary_text = text_bytes[last_pos:]
+                tokens.extend(self._bpe_encode(ordinary_text))
+            
+            return tokens
+        
+        def _bpe_encode(self, text_bytes: bytes) -> list[int]:
+            """对普通文本（无特殊token）进行BPE编码"""
+            if not text_bytes:
+                return []
+            
+            # 初始化为单个字节
+            tokens = [bytes([b]) for b in text_bytes]
+            
+            # 应用合并规则，按照tiktoken的方式：循环直到没有合并发生
+            changed = True
+            while changed and len(tokens) > 1:
+                changed = False
+                # 遍历所有合并规则
+                for merge in self.merges:
+                    # 从左到右扫描tokens
+                    i = 0
+                    while i < len(tokens) - 1:
+                        if tokens[i] == merge[0] and tokens[i+1] == merge[1]:
+                            # 合并
+                            tokens[i] = merge[0] + merge[1]
+                            tokens.pop(i+1)
+                            changed = True
+                            # 合并后，我们跳出内层循环，重新开始扫描所有合并规则
+                            break
+                        i += 1
+                    if changed:
+                        break
+            
+            # 转换为IDs
+            token_ids = []
+            for token in tokens:
+                if token in self.vocab_inv:
+                    token_ids.append(self.vocab_inv[token])
+                else:
+                    # 如果token不在词汇表中，回退到字节级编码
+                    for byte in token:
+                        byte_token = bytes([byte])
+                        token_ids.append(self.vocab_inv[byte_token])
+            
+            return token_ids
+        
+        def decode(self, token_ids: list[int]) -> str:
+            """将token IDs解码为文本"""
+            if not token_ids:
+                return ""
+            
+            # 将token IDs转换为字节
+            bytes_list = []
+            for token_id in token_ids:
+                if token_id in self.vocab:
+                    bytes_list.append(self.vocab[token_id])
+                else:
+                    # 处理未知token ID
+                    bytes_list.append(b'')
+            
+            # 合并所有字节并解码为字符串
+            combined_bytes = b''.join(bytes_list)
+            
+            try:
+                return combined_bytes.decode('utf-8', errors='replace')
+            except UnicodeDecodeError:
+                # 如果UTF-8解码失败，使用错误替换
+                return combined_bytes.decode('utf-8', errors='ignore')
+        
+        def encode_iterable(self, iterable) -> list[int]:
+            """流式编码，适用于大文件"""
+            all_tokens = []
+            for line in iterable:
+                if isinstance(line, str):
+                    text = line
+                else:
+                    text = line.decode('utf-8', errors='replace')
+                all_tokens.extend(self.encode(text))
+            return all_tokens
+    
+    return BPETokenizer(vocab, merges, special_tokens)
+    #raise NotImplementedError
 
 
 def run_train_bpe(
