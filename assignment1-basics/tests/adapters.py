@@ -392,7 +392,7 @@ def run_transformer_lm(
         num_heads (int): Number of heads to use in multi-headed attention. `d_model` must be
             evenly divisible by `num_heads`.
         d_ff (int): Dimensionality of the feed-forward inner layer (section 3.3).
-        rope_theta (float): The RoPE $\Theta$ parameter.
+        rope_theta (float): The RoPE Theta parameter.
         weights (dict[str, Tensor]):
             State dict of our reference implementation. {num_layers} refers to an
             integer between `0` and `num_layers - 1` (the layer index).
@@ -903,7 +903,216 @@ def run_train_bpe(
                 representing that <token1> was merged with <token2>.
                 Merges are ordered by order of creation.
     """
-    _tokenizer = BPETokenizer(vocab_size, special_tokens, **kwargs)
-    _tokenizer.train(input_path)
-    return _tokenizer.vocab, _tokenizer.merges
+    import os
+    import regex as re
+    from collections import defaultdict
+    import heapq
+    from typing import Any, Iterator
+    # Initialize vocabulary with special tokens and single bytes
+    vocab = {}
+    stoi = {}  # bytes -> id
+    itos = {}  # id -> bytes
+    
+    # Add special tokens first
+    special_tokens_bytes = [token.encode('utf-8') for token in special_tokens]
+    for i, token_bytes in enumerate(special_tokens_bytes):
+        vocab[i] = token_bytes
+        stoi[token_bytes] = i
+        itos[i] = token_bytes
+    
+    # Add single byte tokens
+    offset = len(special_tokens_bytes)
+    for i in range(256):
+        byte_token = bytes([i])
+        vocab[i + offset] = byte_token
+        stoi[byte_token] = i + offset
+        itos[i + offset] = byte_token
+    
+    merges = []
+    
+    # Read training data
+    with open(input_path, 'r', encoding='utf-8') as f:
+        text = f.read()
+    
+    # Pre-tokenize using GPT2 pattern
+    GPT2_SPLIT_PATTERN = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+    pat = re.compile(GPT2_SPLIT_PATTERN)
+    
+    def pretokenize(text: str) -> list[bytes]:
+        """Pretokenize text using GPT2 pattern"""
+        str_tokens = pat.findall(text)
+        return [s.encode('utf-8') for s in str_tokens]
+    
+    # Handle special tokens in training data
+    if special_tokens:
+        special_pattern = f"({'|'.join(re.escape(s) for s in special_tokens)})"
+        text_parts = re.split(special_pattern, text)
+    else:
+        text_parts = [text]
+    
+    # Convert text to initial token sequences (single bytes)
+    initial_vocab_map = {v: k for k, v in itos.items()}
+    token_groups = []
+    for part in text_parts:
+        if part in special_tokens or not part:
+            continue
+        words_in_bytes = pretokenize(part)
+        for word in words_in_bytes:
+            # Convert each word to sequence of single-byte token IDs
+            token_ids = [initial_vocab_map[bytes([b])] for b in word]
+            token_groups.append(token_ids)
+    
+    # High-efficiency BPE training using heap and linked list (based on reference implementation)
+    
+    # Custom class for heap ordering
+    class PairItem:
+        def __init__(self, count, token_id1, token_id2, itos):
+            self.count = count
+            self.token_id1 = token_id1
+            self.token_id2 = token_id2
+            self.itos = itos
+            self.bytes1 = itos[token_id1]
+            self.bytes2 = itos[token_id2]
+        
+        def __lt__(self, other):
+            # First by frequency (descending)
+            if self.count != other.count:
+                return self.count > other.count
+            # Then by first token bytes (descending)
+            if self.bytes1 != other.bytes1:
+                return self.bytes1 > other.bytes1
+            # Then by second token bytes (descending)
+            return self.bytes2 > other.bytes2
+        
+        def __eq__(self, other):
+            return (self.count == other.count and 
+                    self.bytes1 == other.bytes1 and 
+                    self.bytes2 == other.bytes2)
+        
+        def get_pair(self):
+            return (self.token_id1, self.token_id2)
+    
+    # Initialize data structures for efficient training
+    idx = 0
+    pair_counts = {}
+    token = {}  # node_id -> token_id
+    pre = {}    # node_id -> previous node_id
+    nxt = {}    # node_id -> next node_id
+    pos = {}    # (token_id1, token_id2) -> set of node_ids where this pair starts
+    
+    # Build initial linked list from token groups
+    for token_lst in token_groups:
+        if not token_lst or len(token_lst) <= 1:
+            continue
+        token_lst_len = len(token_lst)
+        for j, token_id in enumerate(token_lst):
+            idx += 1
+            token[idx] = token_id
+            nxt[idx] = None if j == token_lst_len - 1 else idx + 1
+            pre[idx] = None if j == 0 else idx - 1
+            if j == token_lst_len - 1:
+                continue
+            token_pair = (token_id, token_lst[j + 1])
+            pair_counts[token_pair] = pair_counts.get(token_pair, 0) + 1
+            if token_pair not in pos:
+                pos[token_pair] = set()
+            pos[token_pair].add(idx)
+    
+    # Initialize heap with all pairs
+    heap = []
+    for (a, b), cnt in pair_counts.items():
+        item = PairItem(cnt, a, b, itos)
+        heapq.heappush(heap, item)
+    
+    def update_pair(pair: tuple[int, int], delta: int, pos_idx: int | None = None):
+        """Update the count of a pair and its position in the heap"""
+        if pair is None or None in pair:
+            return
+        pair_counts[pair] = pair_counts.get(pair, 0) + delta
+        cnt = pair_counts[pair]
+        if cnt <= 0:
+            pair_counts.pop(pair, None)
+            pos.pop(pair, None)
+            return
+        if pos_idx is not None:
+            if pair not in pos:
+                pos[pair] = set()
+            if delta > 0:
+                pos[pair].add(pos_idx)
+            elif delta < 0:
+                pos[pair].discard(pos_idx)
+        a, b = pair
+        item = PairItem(cnt, a, b, itos)
+        heapq.heappush(heap, item)
+    
+    # Perform merges until we reach the desired vocabulary size
+    num_merges_needed = vocab_size - len(vocab)
+    while num_merges_needed > 0 and heap:
+        if not pair_counts:
+            break
+        num_merges_needed -= 1
+        
+        # Find the next valid pair to merge
+        while heap:
+            item = heapq.heappop(heap)
+            p1, p2 = item.get_pair()
+            
+            # Check if this pair is still valid
+            if (p1, p2) not in pair_counts or pair_counts[(p1, p2)] != item.count:
+                continue  # This pair has been modified, skip it
+            
+            # Merge the pair
+            p1_bytes, p2_bytes = itos[p1], itos[p2]
+            new_token_bytes = p1_bytes + p2_bytes
+            merges.append((p1_bytes, p2_bytes))
+            
+            # Add new token to vocabulary
+            new_token_id = len(vocab)
+            vocab[new_token_id] = new_token_bytes
+            stoi[new_token_bytes] = new_token_id
+            itos[new_token_id] = new_token_bytes
+            
+            # Update all occurrences of this pair in the linked list
+            pos_lst = list(pos.get((p1, p2), set()))
+            for pos_idx in pos_lst:
+                pre_idx = pre[pos_idx]
+                nxt_idx = nxt[pos_idx]
+                nnxt_idx = nxt[nxt_idx] if nxt_idx is not None else None
+                
+                # Verify this is still a valid occurrence of the pair
+                if nxt_idx is None or token[pos_idx] != p1 or token[nxt_idx] != p2:
+                    continue
+                
+                # Update links and counts for adjacent pairs
+                if pre_idx is not None:
+                    # Update pair ending at pre_idx
+                    update_pair((token[pre_idx], token[pos_idx]), -1, pre_idx)
+                    # Add new pair from pre_idx to new token
+                    update_pair((token[pre_idx], new_token_id), 1, pre_idx)
+                
+                if nnxt_idx is not None:
+                    # Update pair starting at nxt_idx
+                    update_pair((token[nxt_idx], token[nnxt_idx]), -1, nxt_idx)
+                    # Add new pair from new token to nnxt_idx
+                    update_pair((new_token_id, token[nnxt_idx]), 1, pos_idx)
+                
+                # Update the linked list
+                pre[pos_idx] = pre_idx
+                nxt[pos_idx] = nnxt_idx
+                token[pos_idx] = new_token_id
+                
+                # Remove the second token of the pair
+                token[nxt_idx] = None
+                pre[nxt_idx] = None
+                nxt[nxt_idx] = None
+                
+                if nnxt_idx is not None:
+                    pre[nnxt_idx] = pos_idx
+            
+            # Remove the merged pair from our data structures
+            pair_counts.pop((p1, p2), None)
+            pos.pop((p1, p2), None)
+            break
+    
+    return vocab, merges
     #raise NotImplementedError
