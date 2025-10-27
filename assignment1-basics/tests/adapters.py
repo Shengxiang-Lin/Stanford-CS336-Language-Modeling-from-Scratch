@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+from collections import defaultdict
 import os
 from collections.abc import Iterable
-from typing import IO, Any, BinaryIO
+from typing import IO, Any, BinaryIO, Dict
 
 import numpy.typing as npt
 import torch
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
+import regex as re
+PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 
 
 def run_linear(
@@ -902,217 +905,164 @@ def run_train_bpe(
                 representing that <token1> was merged with <token2>.
                 Merges are ordered by order of creation.
     """
-    import regex as re
-    import heapq
-    from tqdm import tqdm
-    # Initialize vocabulary with special tokens and single bytes
-    vocab = {}
-    stoi = {}  # bytes -> id
-    itos = {}  # id -> bytes
+    # Step 1: Initialize Vocabulary
     
-    # Add special tokens first
-    special_tokens_bytes = [token.encode('utf-8') for token in special_tokens]
-    for i, token_bytes in enumerate(special_tokens_bytes):
-        vocab[i] = token_bytes
-        stoi[token_bytes] = i
-        itos[i] = token_bytes
-    
-    # Add single byte tokens
-    offset = len(special_tokens_bytes)
-    for i in range(256):
-        byte_token = bytes([i])
-        vocab[i + offset] = byte_token
-        stoi[byte_token] = i + offset
-        itos[i + offset] = byte_token
-    
-    merges = []
-    
-    # Read training data
-    with open(input_path, 'r', encoding='utf-8') as f:
+    vocab: Dict[int, bytes] = {i: bytes([i]) for i in range(256)}
+    next_id = 256
+
+    special_token_bytes = [token.encode("utf-8") for token in special_tokens]
+    for token_bytes in special_token_bytes:
+        if token_bytes not in vocab.values():
+            vocab[next_id] = token_bytes
+            next_id += 1
+
+    # Step 2: Pre-tokenization with optimizations
+    pre_tokens_cnt = defaultdict(int)
+
+    def to_bytes_list(word: str) -> list[bytes]:
+        """Optimized: return list instead of tuple for faster manipulation"""
+        return [bytes([b]) for b in word.encode("utf-8")]
+
+    with open(input_path, "r", encoding="utf-8") as f:
         text = f.read()
     
-    # Pre-tokenize using GPT2 pattern
-    GPT2_SPLIT_PATTERN = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
-    pat = re.compile(GPT2_SPLIT_PATTERN)
-    
-    def pretokenize(text: str) -> list[bytes]:
-        """Pretokenize text using GPT2 pattern"""
-        str_tokens = pat.findall(text)
-        return [s.encode('utf-8') for s in str_tokens]
-    
-    # Handle special tokens in training data
+    # Use a more efficient approach for splitting
     if special_tokens:
-        special_pattern = f"({'|'.join(re.escape(s) for s in special_tokens)})"
-        text_parts = re.split(special_pattern, text)
+        # Compile regex once for efficiency
+        special_pattern = re.compile("|".join(map(re.escape, special_tokens)))
+        chunks = special_pattern.split(text)
     else:
-        text_parts = [text]
+        chunks = [text]
     
-    # Convert text to initial token sequences (single bytes)
-    initial_vocab_map = {v: k for k, v in itos.items()}
-    token_groups = []
-    for part in tqdm(text_parts, desc="Preprocessing"):
-        if part in special_tokens or not part:
+    # Pre-compile the main pattern
+    main_pattern = re.compile(PAT)
+    
+    for chunk in chunks:
+        if not chunk:  # Skip empty chunks
             continue
-        words_in_bytes = pretokenize(part)
-        for word in words_in_bytes:
-            # Convert each word to sequence of single-byte token IDs
-            token_ids = [initial_vocab_map[bytes([b])] for b in word]
-            token_groups.append(token_ids)
+        # Use finditer for memory efficiency
+        for m in main_pattern.finditer(chunk):
+            word = m.group(0)
+            # Use tuple of bytes for counting (hashable)
+            pre_tokens_cnt[tuple(to_bytes_list(word))] += 1
+
+    # Step 3: Compute BPE Merges with optimizations
+    merges = []
     
-    # High-efficiency BPE training using heap and linked list (based on reference implementation)
+    # Calculate needed merges
+    initial_vocab_size = len(vocab)
+    total_merges_needed = min(vocab_size - initial_vocab_size, len(pre_tokens_cnt) * 10)  # Upper bound
     
-    # Custom class for heap ordering
-    class PairItem:
-        def __init__(self, count, token_id1, token_id2, itos):
-            self.count = count
-            self.token_id1 = token_id1
-            self.token_id2 = token_id2
-            self.itos = itos
-            self.bytes1 = itos[token_id1]
-            self.bytes2 = itos[token_id2]
-        
-        def __lt__(self, other):
-            # First by frequency (descending)
-            if self.count != other.count:
-                return self.count > other.count
-            # Then by first token bytes (descending)
-            if self.bytes1 != other.bytes1:
-                return self.bytes1 > other.bytes1
-            # Then by second token bytes (descending)
-            return self.bytes2 > other.bytes2
-        
-        def __eq__(self, other):
-            return (self.count == other.count and 
-                    self.bytes1 == other.bytes1 and 
-                    self.bytes2 == other.bytes2)
-        
-        def get_pair(self):
-            return (self.token_id1, self.token_id2)
+    # Create progress bar (optional, can remove if still too slow)
+    try:
+        from tqdm import tqdm
+        pbar = tqdm(total=total_merges_needed, desc="Training BPE", unit="merge")
+        use_tqdm = True
+    except ImportError:
+        use_tqdm = False
+
+    # Pre-allocate data structures for efficiency
+    pair_cache = {}
     
-    # Initialize data structures for efficient training
-    idx = 0
-    pair_counts = {}
-    token = {}  # node_id -> token_id
-    pre = {}    # node_id -> previous node_id
-    nxt = {}    # node_id -> next node_id
-    pos = {}    # (token_id1, token_id2) -> set of node_ids where this pair starts
-    
-    # Build initial linked list from token groups
-    for token_lst in tqdm(token_groups, desc="Building initial data structures"):
-        if not token_lst or len(token_lst) <= 1:
-            continue
-        token_lst_len = len(token_lst)
-        for j, token_id in enumerate(token_lst):
-            idx += 1
-            token[idx] = token_id
-            nxt[idx] = None if j == token_lst_len - 1 else idx + 1
-            pre[idx] = None if j == 0 else idx - 1
-            if j == token_lst_len - 1:
+    while len(vocab) < vocab_size:
+        pair_counts = defaultdict(int)
+
+        # Optimized pair counting
+        for token, cnt in pre_tokens_cnt.items():
+            if len(token) <= 1:
                 continue
-            token_pair = (token_id, token_lst[j + 1])
-            pair_counts[token_pair] = pair_counts.get(token_pair, 0) + 1
-            if token_pair not in pos:
-                pos[token_pair] = set()
-            pos[token_pair].add(idx)
-    
-    # Initialize heap with all pairs
-    heap = []
-    for (a, b), cnt in pair_counts.items():
-        item = PairItem(cnt, a, b, itos)
-        heapq.heappush(heap, item)
-    
-    def update_pair(pair: tuple[int, int], delta: int, pos_idx: int | None = None):
-        """Update the count of a pair and its position in the heap"""
-        if pair is None or None in pair:
-            return
-        pair_counts[pair] = pair_counts.get(pair, 0) + delta
-        cnt = pair_counts[pair]
-        if cnt <= 0:
-            pair_counts.pop(pair, None)
-            pos.pop(pair, None)
-            return
-        if pos_idx is not None:
-            if pair not in pos:
-                pos[pair] = set()
-            if delta > 0:
-                pos[pair].add(pos_idx)
-            elif delta < 0:
-                pos[pair].discard(pos_idx)
-        a, b = pair
-        item = PairItem(cnt, a, b, itos)
-        heapq.heappush(heap, item)
-    
-    # Perform merges until we reach the desired vocabulary size
-    num_merges_needed = vocab_size - len(vocab)
-    pbar = tqdm(total=num_merges_needed, desc="BPE merges")
-    while num_merges_needed > 0 and heap:
+                
+            # Use cache for frequent tokens
+            token_key = token
+            if token_key in pair_cache:
+                pairs = pair_cache[token_key]
+            else:
+                pairs = [(token[i], token[i+1]) for i in range(len(token)-1)]
+                pair_cache[token_key] = pairs
+                
+            for pair in pairs:
+                pair_counts[pair] += cnt
+
         if not pair_counts:
-            break
-        num_merges_needed -= 1
+            break  # No more pairs to merge
+
+        # Find the most frequent pair - optimized
+        best_pair = max(pair_counts.items(), key=lambda x: (x[1], x[0]))[0]
+        a, b = best_pair
+
+        # Create new token
+        new_token = a + b
+        vocab[next_id] = new_token
+        next_id += 1
+
+        # Apply the merge with optimizations
+        changes = []
+        tokens_to_remove = []
         
-        # Find the next valid pair to merge
-        while heap:
-            item = heapq.heappop(heap)
-            p1, p2 = item.get_pair()
-            
-            # Check if this pair is still valid
-            if (p1, p2) not in pair_counts or pair_counts[(p1, p2)] != item.count:
-                continue  # This pair has been modified, skip it
-            
-            # Merge the pair
-            p1_bytes, p2_bytes = itos[p1], itos[p2]
-            new_token_bytes = p1_bytes + p2_bytes
-            merges.append((p1_bytes, p2_bytes))
-            
-            # Add new token to vocabulary
-            new_token_id = len(vocab)
-            vocab[new_token_id] = new_token_bytes
-            stoi[new_token_bytes] = new_token_id
-            itos[new_token_id] = new_token_bytes
-            
-            # Update all occurrences of this pair in the linked list
-            pos_lst = list(pos.get((p1, p2), set()))
-            for pos_idx in pos_lst:
-                pre_idx = pre[pos_idx]
-                nxt_idx = nxt[pos_idx]
-                nnxt_idx = nxt[nxt_idx] if nxt_idx is not None else None
+        for token, cnt in pre_tokens_cnt.items():
+            if len(token) <= 1:
+                continue
                 
-                # Verify this is still a valid occurrence of the pair
-                if nxt_idx is None or token[pos_idx] != p1 or token[nxt_idx] != p2:
-                    continue
+            # Fast check if the pair might be in this token
+            if a not in token or b not in token:
+                continue
                 
-                # Update links and counts for adjacent pairs
-                if pre_idx is not None:
-                    # Update pair ending at pre_idx
-                    update_pair((token[pre_idx], token[pos_idx]), -1, pre_idx)
-                    # Add new pair from pre_idx to new token
-                    update_pair((token[pre_idx], new_token_id), 1, pre_idx)
+            # Find occurrences more efficiently
+            indices = []
+            i = 0
+            while i < len(token) - 1:
+                if token[i] == a and token[i+1] == b:
+                    indices.append(i)
+                    i += 1  # Skip next element since we found a pair
+                i += 1
                 
-                if nnxt_idx is not None:
-                    # Update pair starting at nxt_idx
-                    update_pair((token[nxt_idx], token[nnxt_idx]), -1, nxt_idx)
-                    # Add new pair from new token to nnxt_idx
-                    update_pair((new_token_id, token[nnxt_idx]), 1, pos_idx)
+            if indices:
+                # Build new token efficiently
+                new_pre_token = []
+                i = 0
+                while i < len(token):
+                    if i in indices:
+                        new_pre_token.append(new_token)
+                        i += 2
+                    else:
+                        new_pre_token.append(token[i])
+                        i += 1
                 
-                # Update the linked list
-                pre[pos_idx] = pre_idx
-                nxt[pos_idx] = nnxt_idx
-                token[pos_idx] = new_token_id
+                new_pre_token_tuple = tuple(new_pre_token)
+                changes.append((token, new_pre_token_tuple, cnt))
+                tokens_to_remove.append(token)
                 
-                # Remove the second token of the pair
-                token[nxt_idx] = None
-                pre[nxt_idx] = None
-                nxt[nxt_idx] = None
-                
-                if nnxt_idx is not None:
-                    pre[nnxt_idx] = pos_idx
-            
-            # Remove the merged pair from our data structures
-            pair_counts.pop((p1, p2), None)
-            pos.pop((p1, p2), None)
-            break
-        pbar.update(1)
-    pbar.close()
-    print(f"BPE training completed. Final vocabulary size: {len(vocab)}")
+                # Update cache for the new token
+                if len(new_pre_token_tuple) > 1:
+                    new_pairs = [(new_pre_token_tuple[i], new_pre_token_tuple[i+1]) 
+                               for i in range(len(new_pre_token_tuple)-1)]
+                    pair_cache[new_pre_token_tuple] = new_pairs
+
+        # Apply changes efficiently
+        for old_token, new_pre_token, cnt in changes:
+            pre_tokens_cnt[new_pre_token] = pre_tokens_cnt.get(new_pre_token, 0) + cnt
+        
+        # Remove old tokens in batch
+        for old_token in tokens_to_remove:
+            if old_token in pre_tokens_cnt:
+                del pre_tokens_cnt[old_token]
+                if old_token in pair_cache:
+                    del pair_cache[old_token]
+
+        # Record the merge
+        merges.append((a, b))
+        
+        # Update progress
+        if use_tqdm:
+            pbar.update(1)
+            pbar.set_postfix({
+                "vocab_size": len(vocab),
+                "merges": len(merges),
+                "tokens": len(pre_tokens_cnt)
+            })
+
+    if use_tqdm:
+        pbar.close()
+
     return vocab, merges
     #raise NotImplementedError
