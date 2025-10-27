@@ -8,7 +8,7 @@ import argparse
 from utils import _to_device_and_compile
 from model import BasicsTransformerLM
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-from tests.adapters import Tokenizer
+from tests.adapters import BPETokenizer
 
 
 # 1. 设定路径
@@ -24,7 +24,7 @@ with open(MERGES_PATH, 'rb') as f:
     merges = pickle.load(f)
 
 # 3. 构造 tokenizer
-tokenizer = Tokenizer(
+tokenizer = BPETokenizer(
     vocab=vocab,
     merges=merges,
     special_tokens=special_tokens
@@ -69,8 +69,8 @@ def main():
     # ==== 合并原prompt和生成内容 ====
     full_ids = input_ids + output_ids
     text = tokenizer.decode(full_ids)
-    print("输入：", args.prompt)
-    print("生成结果：", text)
+    print("Input:", args.prompt)
+    print("Output:", text)
 
 
 if __name__ == "__main__":
