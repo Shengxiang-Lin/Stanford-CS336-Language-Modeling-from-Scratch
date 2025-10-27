@@ -48,3 +48,9 @@ gunzip owt_valid.txt.gz
 cd ..
 ```
 
+### Experiment     
+After your pass tests, you can use extra scripts in `scripts` to run some experiments, see the following instructions:  
+1. Run `uv run python scripts/train_bpe.py`. Train the tokenizer.    
+2. Run `uv run python scripts/tokenize.py`. Use the trained tokenizer to encode the original training data in `txt` format into integer ids and save it as a one-dimensional array in dat format for easy access during training.  
+3. Run `uv run python scripts/train.py`. Train the model. The default configuration is to train for 5000 steps with a context length of 256 and a batch size of 32, which is a total of 256 x 32 x 5000 = 40M tokens.   
+4. Run `uv run python scripts/generate.py`. Test the model's ability to generate stories.  
