@@ -697,6 +697,159 @@ def run_load_checkpoint(
     return checkpoint['iteration']
     #raise NotImplementedError
 
+from typing import Iterator
+import regex as re_module
+class BPETokenizer:
+    def __init__(self, vocab: dict[int, bytes], merges: list[tuple[bytes, bytes]], special_tokens: list[str] | None = None):
+        self.vocab = vocab.copy()  # id -> bytes
+        self.merges = merges
+        self.special_tokens = special_tokens or []
+        # 创建反向映射 bytes -> id
+        self.vocab_inv = {v: k for k, v in self.vocab.items()}
+        # 为特殊token创建映射
+        self.special_tokens_bytes = [token.encode('utf-8') for token in self.special_tokens]
+        for special_token in self.special_tokens_bytes:
+            if special_token not in self.vocab_inv:
+                new_id = len(self.vocab)
+                self.vocab[new_id] = special_token
+                self.vocab_inv[special_token] = new_id
+        # 构建合并优先级字典
+        self.merge_priority = {}
+        for i, (a, b) in enumerate(merges):
+            self.merge_priority[(a, b)] = i
+        # 构建特殊token trie用于快速查找
+        self.special_trie = self._build_special_trie()
+        pattern = r"""'s|'t|'re|'ve|'m|'ll|'d| ?[\p{L}]+| ?[\p{N}]+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+        self.pat = re_module.compile(pattern)
+
+    def _build_special_trie(self):
+        """构建特殊token的前缀树，用于快速查找"""
+        trie = {}
+        for token_bytes in self.special_tokens_bytes:
+            node = trie
+            for byte in token_bytes:
+                if byte not in node:
+                    node[byte] = {}
+                node = node[byte]
+            node[None] = token_bytes  # 标记结束
+        return trie
+
+    def _find_special_tokens(self, text_bytes: bytes):
+        """在字节序列中查找特殊token"""
+        positions = []
+        i = 0
+        while i < len(text_bytes):
+            node = self.special_trie
+            j = i
+            matched_token = None
+            while j < len(text_bytes) and text_bytes[j] in node:
+                node = node[text_bytes[j]]
+                j += 1
+                if None in node:  # 找到完整的特殊token
+                    matched_token = node[None]
+            if matched_token:
+                positions.append((i, j, matched_token))
+                i = j
+            else:
+                i += 1
+        return positions
+
+    def encode(self, text: str) -> list[int]:
+        """将文本编码为token IDs"""
+        if not text:
+            return []
+        text_bytes = text.encode('utf-8')
+        # 查找特殊token的位置
+        special_positions = self._find_special_tokens(text_bytes)
+        tokens = []
+        last_pos = 0
+        for start, end, special_token in special_positions:
+            # 添加特殊token之前的普通文本
+            if start > last_pos:
+                ordinary_bytes = text_bytes[last_pos:start]
+                ordinary_str = ordinary_bytes.decode('utf-8', errors='replace')
+                for match in self.pat.finditer(ordinary_str):
+                    chunk = match.group(0)
+                    chunk_bytes = chunk.encode('utf-8')
+                    sub_ids = self._bpe_encode(chunk_bytes)
+                    tokens.extend(sub_ids)
+            # 添加特殊token
+            tokens.append(self.vocab_inv[special_token])
+            last_pos = end
+        # 添加剩余文本
+        if last_pos < len(text_bytes):
+            ordinary_bytes = text_bytes[last_pos:]
+            ordinary_str = ordinary_bytes.decode('utf-8', errors='replace')
+            for match in self.pat.finditer(ordinary_str):
+                chunk = match.group(0)
+                chunk_bytes = chunk.encode('utf-8')
+                sub_ids = self._bpe_encode(chunk_bytes)
+                tokens.extend(sub_ids)
+        return tokens
+
+    def _bpe_encode(self, text_bytes: bytes) -> list[int]:
+        """对普通文本（无特殊token）进行BPE编码"""
+        if not text_bytes:
+            return []
+        # 初始化为单个字节
+        tokens = [bytes([b]) for b in text_bytes]
+        # 应用合并规则
+        while len(tokens) > 1:
+            # 找到可以合并的相邻token对
+            best_pair = None
+            best_priority = float('inf')
+            for i in range(len(tokens) - 1):
+                pair = (tokens[i], tokens[i + 1])
+                if pair in self.merge_priority:
+                    priority = self.merge_priority[pair]
+                    if priority < best_priority:
+                        best_priority = priority
+                        best_pair = pair
+            if best_pair is None:
+                break
+            a, b = best_pair
+            merged = a + b
+            # 替换所有出现的best_pair
+            new_tokens = []
+            i = 0
+            while i < len(tokens):
+                if i + 1 < len(tokens) and tokens[i] == a and tokens[i + 1] == b:
+                    new_tokens.append(merged)
+                    i += 2
+                else:
+                    new_tokens.append(tokens[i])
+                    i += 1
+            tokens = new_tokens
+        # 转换为IDs
+        token_ids = []
+        for token in tokens:
+            if token in self.vocab_inv:
+                token_ids.append(self.vocab_inv[token])
+            else:
+                # 如果token不在词汇表中，回退到字节级
+                for byte in token:
+                    byte_token = bytes([byte])
+                    token_ids.append(self.vocab_inv[byte_token])
+        return token_ids
+
+    def decode(self, token_ids: list[int]) -> str:
+        """将token IDs解码为文本"""
+        if not token_ids:
+            return ""
+        # 将token IDs转换为字节
+        bytes_list = []
+        for token_id in token_ids:
+            if token_id in self.vocab:
+                bytes_list.append(self.vocab[token_id])
+            else:
+                bytes_list.append(b'')
+        # 合并所有字节并解码为字符串
+        combined_bytes = b''.join(bytes_list)
+        return combined_bytes.decode('utf-8', errors='replace')
+
+    def encode_iterable(self, iterable) -> Iterator[int]:
+        for line in iterable:
+            yield from self.encode(line)
 
 def get_tokenizer(
     vocab: dict[int, bytes],
@@ -718,160 +871,6 @@ def get_tokenizer(
     Returns:
         A BPE tokenizer that uses the provided vocab, merges, and special tokens.
     """
-    from typing import Iterator
-    import regex as re_module
-    class BPETokenizer:
-        def __init__(self, vocab: dict[int, bytes], merges: list[tuple[bytes, bytes]], special_tokens: list[str] | None = None):
-            self.vocab = vocab.copy()  # id -> bytes
-            self.merges = merges
-            self.special_tokens = special_tokens or []
-            # 创建反向映射 bytes -> id
-            self.vocab_inv = {v: k for k, v in self.vocab.items()}
-            # 为特殊token创建映射
-            self.special_tokens_bytes = [token.encode('utf-8') for token in self.special_tokens]
-            for special_token in self.special_tokens_bytes:
-                if special_token not in self.vocab_inv:
-                    new_id = len(self.vocab)
-                    self.vocab[new_id] = special_token
-                    self.vocab_inv[special_token] = new_id
-            # 构建合并优先级字典
-            self.merge_priority = {}
-            for i, (a, b) in enumerate(merges):
-                self.merge_priority[(a, b)] = i
-            # 构建特殊token trie用于快速查找
-            self.special_trie = self._build_special_trie()
-            pattern = r"""'s|'t|'re|'ve|'m|'ll|'d| ?[\p{L}]+| ?[\p{N}]+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
-            self.pat = re_module.compile(pattern)
-
-        def _build_special_trie(self):
-            """构建特殊token的前缀树，用于快速查找"""
-            trie = {}
-            for token_bytes in self.special_tokens_bytes:
-                node = trie
-                for byte in token_bytes:
-                    if byte not in node:
-                        node[byte] = {}
-                    node = node[byte]
-                node[None] = token_bytes  # 标记结束
-            return trie
-
-        def _find_special_tokens(self, text_bytes: bytes):
-            """在字节序列中查找特殊token"""
-            positions = []
-            i = 0
-            while i < len(text_bytes):
-                node = self.special_trie
-                j = i
-                matched_token = None
-                while j < len(text_bytes) and text_bytes[j] in node:
-                    node = node[text_bytes[j]]
-                    j += 1
-                    if None in node:  # 找到完整的特殊token
-                        matched_token = node[None]
-                if matched_token:
-                    positions.append((i, j, matched_token))
-                    i = j
-                else:
-                    i += 1
-            return positions
-
-        def encode(self, text: str) -> list[int]:
-            """将文本编码为token IDs"""
-            if not text:
-                return []
-            text_bytes = text.encode('utf-8')
-            # 查找特殊token的位置
-            special_positions = self._find_special_tokens(text_bytes)
-            tokens = []
-            last_pos = 0
-            for start, end, special_token in special_positions:
-                # 添加特殊token之前的普通文本
-                if start > last_pos:
-                    ordinary_bytes = text_bytes[last_pos:start]
-                    ordinary_str = ordinary_bytes.decode('utf-8', errors='replace')
-                    for match in self.pat.finditer(ordinary_str):
-                        chunk = match.group(0)
-                        chunk_bytes = chunk.encode('utf-8')
-                        sub_ids = self._bpe_encode(chunk_bytes)
-                        tokens.extend(sub_ids)
-                # 添加特殊token
-                tokens.append(self.vocab_inv[special_token])
-                last_pos = end
-            # 添加剩余文本
-            if last_pos < len(text_bytes):
-                ordinary_bytes = text_bytes[last_pos:]
-                ordinary_str = ordinary_bytes.decode('utf-8', errors='replace')
-                for match in self.pat.finditer(ordinary_str):
-                    chunk = match.group(0)
-                    chunk_bytes = chunk.encode('utf-8')
-                    sub_ids = self._bpe_encode(chunk_bytes)
-                    tokens.extend(sub_ids)
-            return tokens
-
-        def _bpe_encode(self, text_bytes: bytes) -> list[int]:
-            """对普通文本（无特殊token）进行BPE编码"""
-            if not text_bytes:
-                return []
-            # 初始化为单个字节
-            tokens = [bytes([b]) for b in text_bytes]
-            # 应用合并规则
-            while len(tokens) > 1:
-                # 找到可以合并的相邻token对
-                best_pair = None
-                best_priority = float('inf')
-                for i in range(len(tokens) - 1):
-                    pair = (tokens[i], tokens[i + 1])
-                    if pair in self.merge_priority:
-                        priority = self.merge_priority[pair]
-                        if priority < best_priority:
-                            best_priority = priority
-                            best_pair = pair
-                if best_pair is None:
-                    break
-                a, b = best_pair
-                merged = a + b
-                # 替换所有出现的best_pair
-                new_tokens = []
-                i = 0
-                while i < len(tokens):
-                    if i + 1 < len(tokens) and tokens[i] == a and tokens[i + 1] == b:
-                        new_tokens.append(merged)
-                        i += 2
-                    else:
-                        new_tokens.append(tokens[i])
-                        i += 1
-                tokens = new_tokens
-            # 转换为IDs
-            token_ids = []
-            for token in tokens:
-                if token in self.vocab_inv:
-                    token_ids.append(self.vocab_inv[token])
-                else:
-                    # 如果token不在词汇表中，回退到字节级
-                    for byte in token:
-                        byte_token = bytes([byte])
-                        token_ids.append(self.vocab_inv[byte_token])
-            return token_ids
-
-        def decode(self, token_ids: list[int]) -> str:
-            """将token IDs解码为文本"""
-            if not token_ids:
-                return ""
-            # 将token IDs转换为字节
-            bytes_list = []
-            for token_id in token_ids:
-                if token_id in self.vocab:
-                    bytes_list.append(self.vocab[token_id])
-                else:
-                    bytes_list.append(b'')
-            # 合并所有字节并解码为字符串
-            combined_bytes = b''.join(bytes_list)
-            return combined_bytes.decode('utf-8', errors='replace')
-
-        def encode_iterable(self, iterable) -> Iterator[int]:
-            for line in iterable:
-                yield from self.encode(line)
-
     return BPETokenizer(vocab, merges, special_tokens)
     #raise NotImplementedError
 
