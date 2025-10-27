@@ -1,17 +1,17 @@
 from __future__ import annotations
-
 from collections import defaultdict
 import os
 from collections.abc import Iterable
 from typing import IO, Any, BinaryIO, Dict
-
 import numpy.typing as npt
 import torch
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
 import regex as re
-PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+from typing import Iterator
+import regex as re_module
 
+PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 
 def run_linear(
     d_in: int,
@@ -53,7 +53,7 @@ def run_embedding(
     Returns:
         Float[Tensor, "... d_model"]: Batch of embeddings returned by your Embedding layer.
     """
-    return torch.nn.functional.embedding(token_ids, weights)
+    return weights[token_ids]
     #raise NotImplementedError
 
 
@@ -86,7 +86,7 @@ def run_swiglu(
     # swiglu.w1.weight.data = w1_weight
     # swiglu.w2.weight.data = w2_weight
     # swiglu.w3.weight.data = w3_weight
-    gate = torch.nn.functional.silu(torch.matmul(in_features, w1_weight.T))
+    gate = run_silu(torch.matmul(in_features, w1_weight.T))
     value = torch.matmul(in_features, w3_weight.T)
     output = torch.matmul(gate * value, w2_weight.T)
     return output
@@ -115,7 +115,7 @@ def run_scaled_dot_product_attention(
     scores = torch.matmul(Q, K.transpose(-2, -1)) / (d_k ** 0.5)
     if mask is not None:
         scores = scores.masked_fill(mask == False, float('-inf'))
-    attention_weights = torch.nn.functional.softmax(scores, dim=-1)
+    attention_weights = run_softmax(scores, dim=-1)
     output = torch.matmul(attention_weights, V)
     return output
     #raise NotImplementedError
@@ -165,7 +165,7 @@ def run_multihead_self_attention(
     scores = torch.matmul(Q, K.transpose(-2, -1)) / (d_k_scalar ** 0.5)
     mask = torch.triu(torch.ones(seq_len, seq_len, device=in_features.device) * float('-inf'), diagonal=1)
     scores = scores + mask
-    attention_weights = torch.nn.functional.softmax(scores, dim=-1)
+    attention_weights = run_softmax(scores, dim=-1)
     attention_output = torch.matmul(attention_weights, V) 
     attention_output = attention_output.transpose(1, 2).contiguous().view(batch_size, seq_len, d_model)
     output = torch.matmul(attention_output, o_proj_weight.T)
@@ -213,7 +213,6 @@ def run_multihead_self_attention_with_rope(
     batch_size, seq_len, d_in = in_features.shape
     if token_positions is None:
         token_positions = torch.arange(seq_len, device=in_features.device).unsqueeze(0).expand(batch_size, seq_len) 
-    # 每个头的维度
     head_dim = d_model // num_heads
     Q = torch.matmul(in_features, q_proj_weight.T)
     K = torch.matmul(in_features, k_proj_weight.T)
@@ -235,7 +234,7 @@ def run_multihead_self_attention_with_rope(
         diagonal=1
     ).unsqueeze(0).unsqueeze(0)
     attention_scores = attention_scores + causal_mask
-    attention_weights = torch.nn.functional.softmax(attention_scores, dim=-1)
+    attention_weights = run_softmax(attention_scores, dim=-1)
     attention_output = torch.matmul(attention_weights, V)
     attention_output = attention_output.transpose(1, 2).contiguous()
     attention_output = attention_output.view(batch_size, seq_len, d_model)
@@ -450,7 +449,7 @@ def run_transformer_lm(
         Float[Tensor, "batch_size sequence_length vocab_size"]: Tensor with the predicted unnormalized
         next-word distribution for each token.
     """
-    x = torch.nn.functional.embedding(in_indices, weights['token_embeddings.weight'])
+    x = run_embedding(vocab_size, d_model, weights['token_embeddings.weight'], in_indices)
     for i in range(num_layers):
         layer_weights = {
             'attn.q_proj.weight': weights[f'layers.{i}.attn.q_proj.weight'],
@@ -510,7 +509,7 @@ def run_silu(in_features: Float[Tensor, " ..."]) -> Float[Tensor, " ..."]:
         Float[Tensor,"..."]: of with the same shape as `in_features` with the output of applying
         SiLU to each element.
     """
-    return torch.nn.functional.silu(in_features)
+    return in_features * torch.sigmoid(in_features)
     #raise NotImplementedError
 
 
@@ -555,7 +554,12 @@ def run_softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, "
         Float[Tensor, "..."]: Tensor of with the same shape as `in_features` with the output of
         softmax normalizing the specified `dim`.
     """
-    return torch.nn.functional.softmax(in_features, dim=dim)
+    max_vals = in_features.max(dim=dim, keepdim=True).values
+    shifted = in_features - max_vals
+    exp_vals = torch.exp(shifted)
+    sum_exp = exp_vals.sum(dim=dim, keepdim=True)
+    softmax_output = exp_vals / sum_exp
+    return softmax_output
     #raise NotImplementedError
 
 
@@ -574,7 +578,15 @@ def run_cross_entropy(
     Returns:
         Float[Tensor, ""]: The average cross-entropy loss across examples.
     """
-    return torch.nn.functional.cross_entropy(inputs, targets)
+    batch_size = inputs.shape[0]
+    max_vals = inputs.max(dim=1, keepdim=True).values
+    shifted = inputs - max_vals
+    exp_vals = torch.exp(shifted)
+    sum_exp = exp_vals.sum(dim=1, keepdim=True)
+    log_softmax = shifted - torch.log(sum_exp)
+    correct_log_probs = log_softmax[torch.arange(batch_size), targets]
+    losses = -correct_log_probs
+    return losses.mean()
     #raise NotImplementedError
 
 
@@ -700,33 +712,26 @@ def run_load_checkpoint(
     return checkpoint['iteration']
     #raise NotImplementedError
 
-from typing import Iterator
-import regex as re_module
 class BPETokenizer:
     def __init__(self, vocab: dict[int, bytes], merges: list[tuple[bytes, bytes]], special_tokens: list[str] | None = None):
-        self.vocab = vocab.copy()  # id -> bytes
+        self.vocab = vocab.copy()
         self.merges = merges
         self.special_tokens = special_tokens or []
-        # 创建反向映射 bytes -> id
         self.vocab_inv = {v: k for k, v in self.vocab.items()}
-        # 为特殊token创建映射
         self.special_tokens_bytes = [token.encode('utf-8') for token in self.special_tokens]
         for special_token in self.special_tokens_bytes:
             if special_token not in self.vocab_inv:
                 new_id = len(self.vocab)
                 self.vocab[new_id] = special_token
                 self.vocab_inv[special_token] = new_id
-        # 构建合并优先级字典
         self.merge_priority = {}
         for i, (a, b) in enumerate(merges):
             self.merge_priority[(a, b)] = i
-        # 构建特殊token trie用于快速查找
         self.special_trie = self._build_special_trie()
         pattern = r"""'s|'t|'re|'ve|'m|'ll|'d| ?[\p{L}]+| ?[\p{N}]+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
         self.pat = re_module.compile(pattern)
 
     def _build_special_trie(self):
-        """构建特殊token的前缀树，用于快速查找"""
         trie = {}
         for token_bytes in self.special_tokens_bytes:
             node = trie
@@ -734,11 +739,10 @@ class BPETokenizer:
                 if byte not in node:
                     node[byte] = {}
                 node = node[byte]
-            node[None] = token_bytes  # 标记结束
+            node[None] = token_bytes
         return trie
 
     def _find_special_tokens(self, text_bytes: bytes):
-        """在字节序列中查找特殊token"""
         positions = []
         i = 0
         while i < len(text_bytes):
@@ -748,7 +752,7 @@ class BPETokenizer:
             while j < len(text_bytes) and text_bytes[j] in node:
                 node = node[text_bytes[j]]
                 j += 1
-                if None in node:  # 找到完整的特殊token
+                if None in node:
                     matched_token = node[None]
             if matched_token:
                 positions.append((i, j, matched_token))
@@ -758,16 +762,13 @@ class BPETokenizer:
         return positions
 
     def encode(self, text: str) -> list[int]:
-        """将文本编码为token IDs"""
         if not text:
             return []
         text_bytes = text.encode('utf-8')
-        # 查找特殊token的位置
         special_positions = self._find_special_tokens(text_bytes)
         tokens = []
         last_pos = 0
         for start, end, special_token in special_positions:
-            # 添加特殊token之前的普通文本
             if start > last_pos:
                 ordinary_bytes = text_bytes[last_pos:start]
                 ordinary_str = ordinary_bytes.decode('utf-8', errors='replace')
@@ -776,10 +777,8 @@ class BPETokenizer:
                     chunk_bytes = chunk.encode('utf-8')
                     sub_ids = self._bpe_encode(chunk_bytes)
                     tokens.extend(sub_ids)
-            # 添加特殊token
             tokens.append(self.vocab_inv[special_token])
             last_pos = end
-        # 添加剩余文本
         if last_pos < len(text_bytes):
             ordinary_bytes = text_bytes[last_pos:]
             ordinary_str = ordinary_bytes.decode('utf-8', errors='replace')
@@ -791,14 +790,10 @@ class BPETokenizer:
         return tokens
 
     def _bpe_encode(self, text_bytes: bytes) -> list[int]:
-        """对普通文本（无特殊token）进行BPE编码"""
         if not text_bytes:
             return []
-        # 初始化为单个字节
         tokens = [bytes([b]) for b in text_bytes]
-        # 应用合并规则
         while len(tokens) > 1:
-            # 找到可以合并的相邻token对
             best_pair = None
             best_priority = float('inf')
             for i in range(len(tokens) - 1):
@@ -812,7 +807,6 @@ class BPETokenizer:
                 break
             a, b = best_pair
             merged = a + b
-            # 替换所有出现的best_pair
             new_tokens = []
             i = 0
             while i < len(tokens):
@@ -823,30 +817,25 @@ class BPETokenizer:
                     new_tokens.append(tokens[i])
                     i += 1
             tokens = new_tokens
-        # 转换为IDs
         token_ids = []
         for token in tokens:
             if token in self.vocab_inv:
                 token_ids.append(self.vocab_inv[token])
             else:
-                # 如果token不在词汇表中，回退到字节级
                 for byte in token:
                     byte_token = bytes([byte])
                     token_ids.append(self.vocab_inv[byte_token])
         return token_ids
 
     def decode(self, token_ids: list[int]) -> str:
-        """将token IDs解码为文本"""
         if not token_ids:
             return ""
-        # 将token IDs转换为字节
         bytes_list = []
         for token_id in token_ids:
             if token_id in self.vocab:
                 bytes_list.append(self.vocab[token_id])
             else:
                 bytes_list.append(b'')
-        # 合并所有字节并解码为字符串
         combined_bytes = b''.join(bytes_list)
         return combined_bytes.decode('utf-8', errors='replace')
 
@@ -906,26 +895,20 @@ def run_train_bpe(
                 Merges are ordered by order of creation.
     """
     # Step 1: Initialize Vocabulary
-    
     vocab: Dict[int, bytes] = {i: bytes([i]) for i in range(256)}
     next_id = 256
-
     special_token_bytes = [token.encode("utf-8") for token in special_tokens]
     for token_bytes in special_token_bytes:
         if token_bytes not in vocab.values():
             vocab[next_id] = token_bytes
             next_id += 1
-
     # Step 2: Pre-tokenization with optimizations
     pre_tokens_cnt = defaultdict(int)
-
     def to_bytes_list(word: str) -> list[bytes]:
         """Optimized: return list instead of tuple for faster manipulation"""
         return [bytes([b]) for b in word.encode("utf-8")]
-
     with open(input_path, "r", encoding="utf-8") as f:
         text = f.read()
-    
     # Use a more efficient approach for splitting
     if special_tokens:
         # Compile regex once for efficiency
@@ -933,10 +916,8 @@ def run_train_bpe(
         chunks = special_pattern.split(text)
     else:
         chunks = [text]
-    
     # Pre-compile the main pattern
     main_pattern = re.compile(PAT)
-    
     for chunk in chunks:
         if not chunk:  # Skip empty chunks
             continue
@@ -945,33 +926,23 @@ def run_train_bpe(
             word = m.group(0)
             # Use tuple of bytes for counting (hashable)
             pre_tokens_cnt[tuple(to_bytes_list(word))] += 1
-
     # Step 3: Compute BPE Merges with optimizations
     merges = []
-    
     # Calculate needed merges
     initial_vocab_size = len(vocab)
     total_merges_needed = min(vocab_size - initial_vocab_size, len(pre_tokens_cnt) * 10)  # Upper bound
-    
     # Create progress bar (optional, can remove if still too slow)
-    try:
-        from tqdm import tqdm
-        pbar = tqdm(total=total_merges_needed, desc="Training BPE", unit="merge")
-        use_tqdm = True
-    except ImportError:
-        use_tqdm = False
-
+    from tqdm import tqdm
+    pbar = tqdm(total=total_merges_needed, desc="Training BPE", unit="merge")
+    use_tqdm = True
     # Pre-allocate data structures for efficiency
     pair_cache = {}
-    
     while len(vocab) < vocab_size:
         pair_counts = defaultdict(int)
-
         # Optimized pair counting
         for token, cnt in pre_tokens_cnt.items():
             if len(token) <= 1:
                 continue
-                
             # Use cache for frequent tokens
             token_key = token
             if token_key in pair_cache:
@@ -979,34 +950,26 @@ def run_train_bpe(
             else:
                 pairs = [(token[i], token[i+1]) for i in range(len(token)-1)]
                 pair_cache[token_key] = pairs
-                
             for pair in pairs:
                 pair_counts[pair] += cnt
-
         if not pair_counts:
             break  # No more pairs to merge
-
         # Find the most frequent pair - optimized
         best_pair = max(pair_counts.items(), key=lambda x: (x[1], x[0]))[0]
         a, b = best_pair
-
         # Create new token
         new_token = a + b
         vocab[next_id] = new_token
         next_id += 1
-
         # Apply the merge with optimizations
         changes = []
         tokens_to_remove = []
-        
         for token, cnt in pre_tokens_cnt.items():
             if len(token) <= 1:
                 continue
-                
             # Fast check if the pair might be in this token
             if a not in token or b not in token:
                 continue
-                
             # Find occurrences more efficiently
             indices = []
             i = 0
@@ -1015,7 +978,6 @@ def run_train_bpe(
                     indices.append(i)
                     i += 1  # Skip next element since we found a pair
                 i += 1
-                
             if indices:
                 # Build new token efficiently
                 new_pre_token = []
@@ -1027,31 +989,25 @@ def run_train_bpe(
                     else:
                         new_pre_token.append(token[i])
                         i += 1
-                
                 new_pre_token_tuple = tuple(new_pre_token)
                 changes.append((token, new_pre_token_tuple, cnt))
                 tokens_to_remove.append(token)
-                
                 # Update cache for the new token
                 if len(new_pre_token_tuple) > 1:
                     new_pairs = [(new_pre_token_tuple[i], new_pre_token_tuple[i+1]) 
                                for i in range(len(new_pre_token_tuple)-1)]
                     pair_cache[new_pre_token_tuple] = new_pairs
-
         # Apply changes efficiently
         for old_token, new_pre_token, cnt in changes:
             pre_tokens_cnt[new_pre_token] = pre_tokens_cnt.get(new_pre_token, 0) + cnt
-        
         # Remove old tokens in batch
         for old_token in tokens_to_remove:
             if old_token in pre_tokens_cnt:
                 del pre_tokens_cnt[old_token]
                 if old_token in pair_cache:
                     del pair_cache[old_token]
-
         # Record the merge
         merges.append((a, b))
-        
         # Update progress
         if use_tqdm:
             pbar.update(1)
@@ -1060,9 +1016,7 @@ def run_train_bpe(
                 "merges": len(merges),
                 "tokens": len(pre_tokens_cnt)
             })
-
     if use_tqdm:
         pbar.close()
-
     return vocab, merges
     #raise NotImplementedError
