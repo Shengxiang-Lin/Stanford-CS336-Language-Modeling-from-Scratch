@@ -210,7 +210,15 @@ def output_strs():
 
 @pytest.fixture
 def model_id():
-    return "/data/a5-alignment/models/Qwen2.5-Math-1.5B"
+    default_model_path = Path("/data/a5-alignment/models/Qwen2.5-Math-1.5B")
+    local_model_path = (
+        Path(__file__).resolve().parent.parent
+        / "models"
+        / "Qwen2.5-Math-1.5B"
+    )
+    if default_model_path.exists():
+        return str(default_model_path)
+    return str(local_model_path)
 
 
 @pytest.fixture

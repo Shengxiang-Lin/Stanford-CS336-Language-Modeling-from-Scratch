@@ -37,40 +37,42 @@ def run_tokenize_prompt_and_output(
     if tokenizer.pad_token_id is None and tokenizer.eos_token is not None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    prompt_and_output = [
-        prompt_str + output_str
-        for prompt_str, output_str in zip(prompt_strs, output_strs, strict=True)
-    ]
-    tokenized = tokenizer(
-        prompt_and_output,
-        padding=True,
-        return_tensors="pt",
-        add_special_tokens=True,
-    )
-    prompt_tokenized = tokenizer(
-        prompt_strs,
-        add_special_tokens=False,
-    )["input_ids"]
+    prompt_tokenized = tokenizer(prompt_strs, add_special_tokens=False)["input_ids"]
+    output_tokenized = tokenizer(output_strs, add_special_tokens=False)["input_ids"]
 
-    full_input_ids = tokenized["input_ids"]
-    attention_mask = tokenized["attention_mask"].bool()
+    prompt_and_output_tokenized = [
+        prompt_ids + output_ids
+        for prompt_ids, output_ids in zip(
+            prompt_tokenized, output_tokenized, strict=True
+        )
+    ]
+    max_seq_len = max(len(token_ids) for token_ids in prompt_and_output_tokenized)
+    pad_token_id = tokenizer.pad_token_id
+
+    full_input_ids = torch.full(
+        (len(prompt_and_output_tokenized), max_seq_len),
+        fill_value=pad_token_id,
+        dtype=torch.long,
+    )
+    attention_mask = torch.zeros_like(full_input_ids, dtype=torch.bool)
+    response_mask = torch.zeros(
+        (len(prompt_and_output_tokenized), max_seq_len - 1), dtype=torch.bool
+    )
+
+    for row_idx, (prompt_ids, output_ids, token_ids) in enumerate(
+        zip(prompt_tokenized, output_tokenized, prompt_and_output_tokenized, strict=True)
+    ):
+        seq_len = len(token_ids)
+        full_input_ids[row_idx, :seq_len] = torch.tensor(token_ids, dtype=torch.long)
+        attention_mask[row_idx, :seq_len] = True
+
+        response_start = len(prompt_ids) - 1
+        response_end = len(prompt_ids) + len(output_ids) - 1
+        if response_end > response_start:
+            response_mask[row_idx, response_start:response_end] = True
+
     input_ids = full_input_ids[:, :-1]
     labels = full_input_ids[:, 1:]
-    label_attention_mask = attention_mask[:, 1:]
-    response_mask = torch.zeros_like(labels, dtype=torch.bool)
-
-    bos_token_id = tokenizer.bos_token_id
-    for row_idx, prompt_ids in enumerate(prompt_tokenized):
-        prompt_len = len(prompt_ids)
-        if bos_token_id is not None and full_input_ids[row_idx, 0].item() == bos_token_id:
-            prompt_len += 1
-
-        seq_len = int(attention_mask[row_idx].sum().item())
-        response_start = max(prompt_len - 1, 0)
-        response_end = max(seq_len - 1, 0)
-        response_mask[row_idx, response_start:response_end] = True
-
-    response_mask &= label_attention_mask
     return {
         "input_ids": input_ids,
         "labels": labels,
